@@ -44,6 +44,11 @@ type acpSession struct {
 	toolInputMu   sync.Mutex
 	toolInputByID map[string]string // toolCallId -> summarized tool input
 
+	sessionLoadMu            sync.Mutex
+	sessionLoadInProgress    bool
+	sessionLoadReplayUpdates int
+	sessionLoadReplayBytes   int64
+
 	// modesMu guards availableModes and currentMode. Both fields are
 	// populated on handshake (session/new or session/load response) and
 	// updated whenever SetLiveMode succeeds or the server announces a
@@ -211,7 +216,16 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 			"cwd":        s.workDir,
 			"mcpServers": []any{},
 		}
+		s.beginSessionLoadReplay()
 		loadRes, err := s.tr.call(s.ctx, "session/load", loadParams)
+		replayUpdates, replayBytes := s.endSessionLoadReplay()
+		if replayUpdates > 0 {
+			slog.Debug("acp: suppressed session/load replay updates",
+				"session_id", resumeSessionID,
+				"updates", replayUpdates,
+				"bytes", replayBytes,
+			)
+		}
 		if err != nil {
 			slog.Warn("acp: session/load failed, starting new session", "error", err)
 		} else {
@@ -219,8 +233,18 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) error 
 				SessionID string         `json:"sessionId"`
 				Modes     *acpModesBlock `json:"modes"`
 			}
-			if json.Unmarshal(loadRes, &lr) == nil && lr.SessionID != "" {
-				s.setACPSessionID(lr.SessionID)
+			if err := json.Unmarshal(loadRes, &lr); err != nil {
+				slog.Warn("acp: session/load response invalid, starting new session", "error", err)
+			} else {
+				loadedSessionID := lr.SessionID
+				if loadedSessionID == "" {
+					loadedSessionID = resumeSessionID
+				}
+				s.setACPSessionID(loadedSessionID)
+				slog.Debug("acp: session loaded",
+					"requested_session_id", resumeSessionID,
+					"session_id", loadedSessionID,
+				)
 				s.absorbModes(lr.Modes)
 				return nil
 			}
@@ -370,14 +394,43 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 		slog.Debug("acp: notification", "method", method)
 		return
 	}
-	s.cacheToolCallInput(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
+	if s.recordSessionLoadReplay(params) {
+		return
+	}
+	s.cacheToolCallInput(params)
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
 	slog.Debug("acp: session/update", "session_id", sid, "params", string(params))
 	for _, ev := range mapSessionUpdate(sid, params) {
 		s.emit(ev)
 	}
+}
+
+func (s *acpSession) beginSessionLoadReplay() {
+	s.sessionLoadMu.Lock()
+	s.sessionLoadInProgress = true
+	s.sessionLoadReplayUpdates = 0
+	s.sessionLoadReplayBytes = 0
+	s.sessionLoadMu.Unlock()
+}
+
+func (s *acpSession) recordSessionLoadReplay(params json.RawMessage) bool {
+	s.sessionLoadMu.Lock()
+	defer s.sessionLoadMu.Unlock()
+	if !s.sessionLoadInProgress {
+		return false
+	}
+	s.sessionLoadReplayUpdates++
+	s.sessionLoadReplayBytes += int64(len(params))
+	return true
+}
+
+func (s *acpSession) endSessionLoadReplay() (int, int64) {
+	s.sessionLoadMu.Lock()
+	defer s.sessionLoadMu.Unlock()
+	s.sessionLoadInProgress = false
+	return s.sessionLoadReplayUpdates, s.sessionLoadReplayBytes
 }
 
 // maybeAbsorbCurrentModeUpdate watches session/update notifications
